@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
+    "hooks:install": "lefthook install",
     "start": "node dist/server.js",
     "test": "tsc && node --import tsx --test src/*.test.ts",
     "tui": "node --experimental-ffi dist/tui/main.js",
@@ -21,6 +22,7 @@
   "devDependencies": {
     "@types/node": "^26.0.0",
     "@types/react": "^19.3.0",
+    "lefthook": "2.2.2",
     "tsx": "^4.20.0",
     "typescript": "^6.0.0"
   }

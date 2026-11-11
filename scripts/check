@@ -2,8 +2,8 @@
 set -eu
 cd "$(dirname "$0")/.."
 cargo fmt --all -- --check
-cargo test --workspace -- --include-ignored
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked -- --include-ignored
+cargo clippy --workspace --all-targets --locked -- -D warnings
 node agent/node_modules/typescript/bin/tsc --project agent
 (cd agent && node --import tsx --test src/*.test.ts)
 node agent/node_modules/typescript/bin/tsc --project agent/tsconfig.test.json

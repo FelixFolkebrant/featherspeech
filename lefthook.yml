@@ -1,0 +1,39 @@
+pre-commit:
+  commands:
+    rustfmt:
+      glob: "*.rs"
+      run: rustfmt --check --edition 2024 --config skip_children=true {staged_files}
+    clippy:
+      glob:
+        - "*.rs"
+        - Cargo.toml
+        - crates/audio-engine/Cargo.toml
+        - Cargo.lock
+      run: cargo clippy --workspace --all-targets --locked -- -D warnings
+    typescript:
+      glob:
+        - "*.ts"
+        - "*.tsx"
+        - agent/package.json
+        - agent/package-lock.json
+        - agent/tsconfig.json
+        - agent/tsconfig.test.json
+      run: node agent/node_modules/typescript/bin/tsc --project agent && node agent/node_modules/typescript/bin/tsc --project agent/tsconfig.test.json
+    ruff:
+      glob:
+        - "*.py"
+        - scripts/vc
+        - scripts/tts
+      run: tts/.venv/bin/ruff check {staged_files} && tts/.venv/bin/ruff format --check {staged_files}
+
+commit-msg:
+  commands:
+    subject:
+      run: python3 scripts/check-git.py message {1}
+
+pre-push:
+  commands:
+    branch:
+      run: python3 scripts/check-git.py branch
+    tests:
+      run: scripts/check
