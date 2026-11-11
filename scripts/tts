@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Preview or compare local speech models without a microphone, cloud request, or service change."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import runpy
+import sys
+import threading
+import time
+import wave
+from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def main():
+    python = ROOT / "tts/.venv/bin/python"
+    if Path(sys.prefix) != ROOT / "tts/.venv":
+        if not python.exists():
+            raise SystemExit("Run scripts/vc setup first")
+        os.execv(python, [str(python), __file__, *sys.argv[1:]])
+    sys.path.insert(0, str(ROOT / "tts"))
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        from benchmark import main as benchmark_main
+
+        return benchmark_main(sys.argv[2:])
+    from backends import KITTEN_MODELS, KITTEN_VOICES, SAMPLE_RATE, Settings
+    from server import Synthesizer
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=["list", "preview", "compare"], help="Also: test --help")
+    parser.add_argument("--backend", choices=["pocket", "kitten"])
+    parser.add_argument("--model", choices=list(KITTEN_MODELS), help="Kitten model size")
+    parser.add_argument("--voice", help="Voice for the chosen backend (preview only)")
+    parser.add_argument(
+        "--text", default="The time is half past three, and I'm ready for your next question."
+    )
+    parser.add_argument("--runs", type=int, default=3, help="Warm trials per model for compare")
+    parser.add_argument("--output", type=Path, help="WAV file (preview) or result directory (compare)")
+    args = parser.parse_args()
+    if args.command == "list":
+        from benchmark import POCKET_VOICES, installed_languages
+
+        print("pocket: original 100M model; default voice alba; native frame streaming")
+        print("Pocket voices:", ", ".join(POCKET_VOICES))
+        print("Installed Pocket model identifiers:", ", ".join(installed_languages()))
+        for name, (repo, _) in KITTEN_MODELS.items():
+            print(f"kitten / {name:5}: {repo}; phrase streaming")
+        print("Kitten voices:", ", ".join(KITTEN_VOICES))
+        print("Voice test: scripts/tts test --help; editable settings: tts/benchmark.toml")
+        return
+    if not args.text.strip() or len(args.text) > 2000:
+        parser.error("--text must contain 1–2000 non-whitespace characters")
+    if not 1 <= args.runs <= 100:
+        parser.error("--runs must be 1–100")
+    if args.command == "compare" and (args.backend or args.model or args.voice):
+        parser.error("compare uses Pocket and all three Kitten sizes with their configured voices")
+    # Reuse the launcher's .env precedence; never print its environment or API credentials.
+    env = runpy.run_path(str(ROOT / "scripts/vc"))["environment"]()
+    if args.backend:
+        env["VC_TTS_BACKEND"] = args.backend
+    if args.model:
+        env["VC_KITTEN_MODEL"] = args.model
+    if args.voice:
+        key = "VC_KITTEN_VOICE" if env.get("VC_TTS_BACKEND") == "kitten" else "VC_VOICE"
+        env[key] = args.voice
+    env["VC_MOCK_TTS"] = "0"
+    settings = Settings.from_env(env)
+    if args.model and settings.backend != "kitten":
+        parser.error("--model requires --backend kitten")
+    configs = (
+        [replace(settings, backend="pocket")]
+        + [replace(settings, backend="kitten", kitten_model=name) for name in KITTEN_MODELS]
+        if args.command == "compare"
+        else [settings]
+    )
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    directory = ROOT / "run/tts" / stamp
+    if args.command == "compare" and args.output:
+        directory = args.output.resolve()
+    reports = []
+    for config in configs:
+        label = config.backend + ("-" + config.kitten_model if config.backend == "kitten" else "")
+        output = directory / f"{label}.wav"
+        if args.command == "preview" and args.output:
+            output = args.output.resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Loading {label}…", flush=True)
+        start = time.perf_counter()
+        synth = Synthesizer(config)
+        load_ms = (time.perf_counter() - start) * 1000
+        trials = []
+        for run in range(args.runs if args.command == "compare" else 1):
+            pcm = bytearray()
+            first_ms = None
+            start = time.perf_counter()
+            for chunk in synth.generate(args.text, threading.Event()):
+                if first_ms is None:
+                    first_ms = (time.perf_counter() - start) * 1000
+                pcm.extend(chunk)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            if first_ms is None:
+                raise RuntimeError(f"{label} produced no audio")
+            duration = len(pcm) / (2 * SAMPLE_RATE)
+            trials.append(
+                {
+                    "first_audio_ms": first_ms,
+                    "elapsed_ms": elapsed_ms,
+                    "audio_seconds": duration,
+                    "rtf": elapsed_ms / (duration * 1000),
+                }
+            )
+            if run == 0:
+                with wave.open(str(output), "wb") as wav:
+                    wav.setparams((1, 2, SAMPLE_RATE, 0, "NONE", "not compressed"))
+                    wav.writeframes(pcm)
+        ordered = sorted(t["first_audio_ms"] for t in trials)
+        p50, p95 = (ordered[max(0, math.ceil(q * len(ordered)) - 1)] for q in (0.5, 0.95))
+        report = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "config": synth.info,
+            "load_and_warm_ms": load_ms,
+            "first_audio_p50_ms": p50,
+            "first_audio_p95_ms": p95,
+            "trials": trials,
+            "wav": str(output),
+        }
+        reports.append(report)
+        output.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
+        print(
+            f"{label}: first audio P50 {p50:.0f} ms / P95 {p95:.0f} ms (n={len(trials)}) → {output}",
+            flush=True,
+        )
+        del synth
+    if args.command == "compare":
+        path = directory / "comparison.json"
+        path.write_text(json.dumps(reports, indent=2) + "\n")
+        print(f"Results: {path}")
+    print(
+        "Warm local synthesis timings only; exclude HTTP, LLM, and playback. Samples were saved, not played."
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

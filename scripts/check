@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+cargo fmt --all -- --check
+cargo test --workspace -- --include-ignored
+cargo clippy --workspace --all-targets -- -D warnings
+node agent/node_modules/typescript/bin/tsc --project agent
+(cd agent && node --import tsx --test src/*.test.ts)
+node agent/node_modules/typescript/bin/tsc --project agent/tsconfig.test.json
+(cd agent && TSX_TSCONFIG_PATH=tsconfig.test.json node --experimental-ffi --import tsx --test src/tui/*.test.tsx)
+tts/.venv/bin/python -m pytest tests tts/tests -q
+tts/.venv/bin/ruff check tts scripts tests scripts/vc scripts/tts
+tts/.venv/bin/ruff format --check tts scripts tests scripts/vc scripts/tts

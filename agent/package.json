@@ -1,0 +1,27 @@
+{
+  "name": "vc-agent",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "test": "tsc && node --import tsx --test src/*.test.ts",
+    "tui": "node --experimental-ffi dist/tui/main.js",
+    "test:tui": "tsc && TSX_TSCONFIG_PATH=tsconfig.test.json node --experimental-ffi --import tsx --test src/tui/*.test.tsx"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "1.5.0",
+    "@earendil-works/pi-ai": "1.5.0",
+    "@opentui/core": "0.8.3",
+    "@opentui/react": "0.8.3",
+    "@sinclair/typebox": "^0.34.0",
+    "react": "19.2.4",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "@types/react": "^19.3.0",
+    "tsx": "^4.20.0",
+    "typescript": "^6.0.0"
+  }
+}

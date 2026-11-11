@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""Project launcher and audio-device lifecycle supervisor. Python standard library only."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+from urllib.parse import urlparse
+
+ROOT = Path(__file__).resolve().parent.parent
+RUN = ROOT / "run"
+SERVICE = "vc-device.service"
+STOP = False
+
+
+def notice(event, **data):
+    print(
+        json.dumps(
+            {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "component": "supervisor",
+                "event": event,
+                **data,
+            }
+        ),
+        flush=True,
+    )
+
+
+def command(args, **kwargs):
+    return subprocess.run([str(x) for x in args], check=True, cwd=ROOT, **kwargs)
+
+
+def pactl(*args):
+    return command(["pactl", *args], capture_output=True, text=True).stdout.strip()
+
+
+def environment():
+    env = os.environ.copy()
+    path = ROOT / ".env"
+    if path.exists():
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                raise RuntimeError("Invalid .env line (expected KEY=value)")
+            key, value = line.removeprefix("export ").split("=", 1)
+            words = shlex.split(value, comments=True)
+            env.setdefault(key.strip(), " ".join(words))
+    env["VC_AGENT_SOCKET"] = str(RUN / "agent.sock")
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def agent_environment(env, settings):
+    """Shared config is authoritative; standalone agent env knobs remain supported."""
+    agent = settings.get("agent", {})
+    return {
+        **env,
+        "VC_HISTORY_TURNS": str(agent.get("history_turns", 64)),
+        "VC_MAX_TOKENS": str(agent.get("max_response_tokens", 1024)),
+    }
+
+
+def devices():
+    return json.loads(pactl("-f", "json", "list", "sources")), json.loads(
+        pactl("-f", "json", "list", "sinks")
+    )
+
+
+def select_pair(sources, sinks, binding):
+    if not binding:
+        return None
+
+    def matches(device, kind):
+        if device["name"].endswith(".monitor"):
+            return False
+        props = device.get("properties", {})
+        expected = binding[kind]
+        return device["name"] == expected["name"] and all(
+            props.get(k) == v for k, v in expected["properties"].items()
+        )
+
+    source = [s for s in sources if matches(s, "source")]
+    sink = [s for s in sinks if matches(s, "sink")]
+    if len(source) != 1 or len(sink) != 1:
+        return None
+    return source[0]["name"], sink[0]["name"]
+
+
+def binding():
+    path = ROOT / "device.local.json"
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def terminate(process):
+    if process.poll() is not None:
+        return
+    os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+
+
+def start_pair(pair, env, config):
+    if not env.get("OPENROUTER_API_KEY") and env.get("VC_MOCK_AGENT") != "1":
+        raise RuntimeError("Set OPENROUTER_API_KEY in .env before starting")
+    engine = ROOT / "target/release/vc-audio"
+    node = shutil.which("node")
+    if (
+        not node
+        or not engine.exists()
+        or not (ROOT / "agent/dist/server.js").exists()
+        or not (ROOT / "tts/.venv/bin/python").exists()
+    ):
+        raise RuntimeError("Run scripts/vc setup first")
+    command([engine, "--config", config, "check"], stdout=subprocess.DEVNULL)
+    settings = tomllib.loads(Path(config).read_text())
+    agent_path = (ROOT / settings["services"]["agent_socket"]).resolve()
+    env = agent_environment(env, settings)
+    env["VC_AGENT_SOCKET"] = str(agent_path)
+    tts_url = urlparse(settings["services"]["tts_url"])
+    if (
+        tts_url.hostname not in ("localhost", "127.0.0.1")
+        or not tts_url.port
+        or tts_url.path not in ("", "/")
+    ):
+        raise RuntimeError("TTS URL must be a loopback address and port without a path")
+    capture_name, playback_name = settings["audio"]["input"], settings["audio"]["output"]
+    if any(
+        not name
+        or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for c in name)
+        for name in (capture_name, playback_name)
+    ):
+        raise RuntimeError("Use simple PipeWire node names in audio.input and audio.output")
+    # Refuse stale virtual devices instead of accidentally attaching to another process.
+    sources, sinks = devices()
+    if any(d["name"] in (capture_name, playback_name) for d in sources + sinks):
+        raise RuntimeError(
+            f"{capture_name}/{playback_name} already exist; inspect pactl list modules before restarting"
+        )
+    module = pactl(
+        "load-module",
+        "module-echo-cancel",
+        f"source_master={pair[0]}",
+        f"sink_master={pair[1]}",
+        f"source_name={capture_name}",
+        f"sink_name={playback_name}",
+        "aec_method=webrtc",
+        "rate=48000",
+        "channels=1",
+        "channel_map=mono",
+    )
+    processes = []
+    handles = []
+    try:
+        # Log secondary-service JSON separately, so the terminal stays readable.
+        logdir = ROOT / settings["logging"]["directory"]
+        logdir.mkdir(exist_ok=True, parents=True)
+        session = f"{time.time_ns()}"
+        for name, args in [
+            ("agent", [node, "agent/dist/server.js"]),
+            (
+                "tts",
+                [
+                    "tts/.venv/bin/python",
+                    "-m",
+                    "uvicorn",
+                    "server:app",
+                    "--app-dir",
+                    "tts",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(tts_url.port),
+                    "--no-access-log",
+                    "--log-level",
+                    "warning",
+                ],
+            ),
+        ]:
+            handle = open(logdir / f"{session}-{name}.jsonl", "a")
+            handles.append(handle)
+            processes.append(
+                subprocess.Popen(
+                    args, cwd=ROOT, env=env, stdout=handle, stderr=handle, start_new_session=True
+                )
+            )
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline and not STOP:
+            if any(p.poll() is not None for p in processes):
+                raise RuntimeError(f"Service exited; see logs/{session}-*.jsonl")
+            # Start Rust as soon as IPC exists: startup cue precedes model warmup.
+            # Rust waits for TTS health before emitting the distinct ready cue.
+            try:
+                with socket.socket(socket.AF_UNIX) as probe:
+                    probe.settimeout(0.3)
+                    probe.connect(str(agent_path))
+                    if json.loads(probe.recv(65536).split(b"\n")[0]).get("type") == "ready":
+                        break
+            except (OSError, ValueError):
+                pass
+            if pair_absent(pair):
+                return
+            time.sleep(0.2)
+        else:
+            if STOP:
+                return
+            raise RuntimeError(f"Service startup timed out; see logs/{session}-*.jsonl")
+        processes.append(
+            subprocess.Popen([engine, "--config", config, "run"], cwd=ROOT, env=env, start_new_session=True)
+        )
+        notice("connected", source=pair[0], sink=pair[1], aec="webrtc")
+        while not STOP:
+            if pair_absent(pair):
+                notice("disconnected")
+                break
+            if any(p.poll() is not None for p in processes):
+                raise RuntimeError("A component exited; see logs")
+            time.sleep(0.5)
+    finally:
+        for p in reversed(processes):
+            terminate(p)
+        for handle in handles:
+            handle.close()
+        try:
+            pactl("unload-module", module)
+        except subprocess.CalledProcessError:
+            pass
+
+
+def pair_absent(pair):
+    try:
+        sources, sinks = devices()
+        return not any(d["name"] == pair[0] for d in sources) or not any(d["name"] == pair[1] for d in sinks)
+    except subprocess.CalledProcessError:
+        return True
+
+
+def setup():
+    uv = shutil.which("uv") or str(ROOT / ".tools/uv/bin/uv")
+    if not Path(uv).exists():
+        command([sys.executable, "-m", "venv", ".tools/uv"])
+        command([".tools/uv/bin/pip", "install", "uv==0.13.7"])
+    command([uv, "sync", "--project", "tts", "--locked"])
+    command(["npm", "--prefix", "agent", "ci"])
+    command(["npm", "--prefix", "agent", "run", "build"])
+    command(["cargo", "build", "--release", "--locked"])
+    command([sys.executable, "scripts/download-models.py"])
+    command(["tts/.venv/bin/python", "scripts/warm-tts.py"], env=environment())
+    notice("setup_complete")
+
+
+def install_service():
+    node = shutil.which("node")
+    if not node:
+        raise RuntimeError("node not found")
+    path = Path.home() / ".config/systemd/user" / SERVICE
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # systemd has its own quoting rules; escape specifiers and backslashes.
+    def quote(value):
+        return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
+
+    path.write_text(
+        "[Unit]\nDescription=Voice assistant device connection watcher\nAfter=pipewire-pulse.service\n\n[Service]\nType=simple\n"
+        + f"WorkingDirectory={str(ROOT).replace('%', '%%')}\nExecStart={quote(sys.executable)} {quote(ROOT / 'scripts/vc')} watch\n"
+        + f"Environment={quote('PATH=' + str(Path(node).parent) + ':/usr/local/bin:/usr/bin:/bin')}\n"
+        + "Restart=on-failure\nRestartSec=3\nTimeoutStopSec=20\nKillMode=mixed\n\n[Install]\nWantedBy=default.target\n"
+    )
+    command(["systemd-analyze", "--user", "verify", path])
+    command(["systemctl", "--user", "daemon-reload"])
+    command(["systemctl", "--user", "enable", "--now", SERVICE])
+    notice("watcher_installed", service=str(path))
+
+
+def tui(args):
+    """Attach to voice mode, or own an isolated text backend until the UI exits."""
+    env = environment()
+    config = tomllib.loads(Path(args.config).read_text())
+    env["VC_MAX_TOKENS"] = str(config.get("agent", {}).get("max_response_tokens", 1024))
+    env["VC_HISTORY_TURNS"] = str(config.get("agent", {}).get("history_turns", 64))
+    agent_path = Path(config.get("services", {}).get("agent_socket", "run/agent.sock")).resolve()
+    env["VC_AGENT_SOCKET"] = str(agent_path)
+    control_path = Path(env.get("VC_CONTROL_SOCKET", str(agent_path).removesuffix(".sock") + ".control.sock"))
+    owned = None
+    handle = None
+    if args.demo:
+        import tempfile
+
+        demo_dir = Path(tempfile.mkdtemp(prefix="vc-tui-demo-"))
+        env.update(
+            VC_AGENT_SOCKET=str(demo_dir / "agent.sock"),
+            VC_CONTROL_SOCKET=str(demo_dir / "control.sock"),
+            VC_ROOM_DB=":memory:",
+            VC_MOCK_AGENT="1",
+            VC_TEXT_ONLY="1",
+            VC_TUI_DEMO="1",
+        )
+        control_path = demo_dir / "control.sock"
+    try:
+        # A separate subscription socket can be probed without disturbing audio.
+        connected = False
+        if not args.demo:
+            try:
+                with socket.socket(socket.AF_UNIX) as probe:
+                    probe.settimeout(0.5)
+                    probe.connect(str(control_path))
+                    connected = True
+            except OSError:
+                pass
+        if not connected:
+            if not env.get("OPENROUTER_API_KEY") and not args.demo:
+                raise RuntimeError("Set OPENROUTER_API_KEY in .env, or use scripts/vc tui --demo")
+            RUN.mkdir(exist_ok=True, mode=0o700)
+            handle = open(RUN / "tui-backend.jsonl", "a")
+            env["VC_TEXT_ONLY"] = "1"
+            owned = subprocess.Popen(
+                ["node", str(ROOT / "agent/dist/server.js")],
+                cwd=ROOT,
+                env=env,
+                stdout=handle,
+                stderr=handle,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if owned.poll() is not None:
+                    raise RuntimeError("Room backend exited; see run/tui-backend.jsonl")
+                if control_path.exists():
+                    break
+                time.sleep(0.05)
+            else:
+                raise RuntimeError("Room backend timed out; see run/tui-backend.jsonl")
+        command(["node", "--experimental-ffi", "agent/dist/tui/main.js"], env=env)
+    finally:
+        if owned:
+            terminate(owned)
+        if handle:
+            handle.close()
+        if args.demo:
+            shutil.rmtree(demo_dir, ignore_errors=True)
+
+
+def main():
+    global STOP
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "command",
+        choices=["setup", "run", "watch", "devices", "bind", "doctor", "install-service", "stats", "tui"],
+    )
+    parser.add_argument(
+        "--default-device",
+        action="store_true",
+        help="Explicitly use this session's default microphone/speaker",
+    )
+    parser.add_argument("--config", default="config.toml")
+    parser.add_argument("--source", help="PipeWire source name for bind")
+    parser.add_argument("--sink", help="PipeWire sink name for bind")
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Run an isolated mock TUI without cloud calls or microphone access",
+    )
+    args = parser.parse_args()
+    if args.command == "bind":
+        if args.default_device and (args.source or args.sink):
+            parser.error("Use either --default-device or both --source and --sink")
+        if not args.default_device and not (args.source and args.sink):
+            parser.error("bind requires --source and --sink, or --default-device")
+    elif args.source or args.sink:
+        parser.error("--source and --sink are only used with bind")
+    os.chdir(ROOT)
+    if args.command == "tui":
+        return tui(args)
+    if args.command == "setup":
+        return setup()
+    if args.command == "stats":
+        return command([sys.executable, "scripts/stats.py", "logs"])
+    if args.command == "install-service":
+        return install_service()
+    if args.command == "doctor":
+        env = environment()
+        for name in ["node", "cargo", "cmake", "clang", "pkg-config", "pactl"]:
+            print(f"{name:22} {shutil.which(name) or 'MISSING'}")
+        print(
+            f"{'OpenRouter key':22} {'configured' if env.get('OPENROUTER_API_KEY') else 'missing — set .env'}"
+        )
+        selected = binding()
+        print(
+            f"{'Device binding':22} {'configured' if selected else 'missing — run scripts/vc devices, then bind'}"
+        )
+        print(f"{'Bound device present':22} {bool(select_pair(*devices(), selected))}")
+        return
+    if args.command in ("devices", "bind"):
+        sources, sinks = devices()
+        if args.command == "devices":
+            for kind, values in [("source", sources), ("sink", sinks)]:
+                for d in values:
+                    print(
+                        json.dumps(
+                            {
+                                "kind": kind,
+                                "name": d["name"],
+                                "description": d.get("description"),
+                                "properties": {
+                                    k: v
+                                    for k, v in d.get("properties", {}).items()
+                                    if k.startswith("device.")
+                                },
+                            }
+                        )
+                    )
+            return
+        source_name = pactl("get-default-source") if args.default_device else args.source
+        sink_name = pactl("get-default-sink") if args.default_device else args.sink
+        source = next(
+            (d for d in sources if d["name"] == source_name and not d["name"].endswith(".monitor")), None
+        )
+        sink = next((d for d in sinks if d["name"] == sink_name), None)
+        if source is None or sink is None:
+            raise RuntimeError("Selected source or sink is unavailable; list names with scripts/vc devices")
+        pair = (source_name, sink_name)
+        result = {}
+        for kind, name, values in [("source", pair[0], sources), ("sink", pair[1], sinks)]:
+            d = next(d for d in values if d["name"] == name)
+            result[kind] = {
+                "name": name,
+                "properties": {
+                    k: v
+                    for k, v in d.get("properties", {}).items()
+                    if k in ("device.serial", "device.vendor.id", "device.product.id")
+                },
+            }
+        path = ROOT / "device.local.json"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as output:
+            os.fchmod(fd, 0o600)
+            output.write(json.dumps(result, indent=2) + "\n")
+        notice("device_bound", path="device.local.json")
+        return
+
+    def stopped(*_):
+        global STOP
+        STOP = True
+
+    signal.signal(signal.SIGINT, stopped)
+    signal.signal(signal.SIGTERM, stopped)
+    RUN.mkdir(exist_ok=True, mode=0o700)
+    with open(RUN / "supervisor.lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError(f"Supervisor already running; stop {SERVICE} before a manual run") from None
+        selected = binding()
+        if not selected and not args.default_device:
+            raise RuntimeError(
+                "Bind a device with scripts/vc bind --source NAME --sink NAME, or use --default-device"
+            )
+        notice("waiting_for_device", binding="default" if args.default_device else "device.local.json")
+        while not STOP:
+            sources, sinks = devices()
+            pair = (
+                (pactl("get-default-source"), pactl("get-default-sink"))
+                if args.default_device
+                else select_pair(sources, sinks, selected)
+            )
+            if pair:
+                try:
+                    start_pair(pair, environment(), args.config)
+                except (RuntimeError, subprocess.CalledProcessError) as error:
+                    notice("session_error", error=str(error))
+                    if args.command == "run":
+                        raise
+                    # Retry after failure; a new device/reconnected service can recover.
+                    for _ in range(20):
+                        if STOP:
+                            break
+                        time.sleep(0.5)
+            elif args.command == "run":
+                raise RuntimeError(
+                    "Bound device is absent. Use watch, or --default-device for an explicit default-device test."
+                )
+            if args.command == "run":
+                break
+            time.sleep(0.75)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, subprocess.CalledProcessError) as error:
+        notice("error", error=str(error))
+        sys.exit(1)

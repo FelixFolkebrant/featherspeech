@@ -1,0 +1,51 @@
+# Edit this file, then run: scripts/tts test
+# Print every planned combination without generating: scripts/tts test --dry-run
+# Values here are independent of the live assistant's .env settings.
+
+# Models: "pocket", "kitten-nano" (15M), "kitten-micro" (40M), "kitten-mini" (80M).
+models = ["pocket", "kitten-nano", "kitten-micro", "kitten-mini"]
+threads = 4                         # CPU threads per model; integer 1–64.
+runs = 3                            # Measured repetitions per voice/speed/prompt; 1–100.
+seed = 42                           # Trial seeds are seed, seed+1, ...; shared across voices.
+timeout_seconds = 180               # Per combination, including loading and all its trials.
+output = "run/tts/voice-tests"        # Relative to project root; each run gets a new UTC folder.
+
+[pocket]
+# Selected voices (every selected voice is generated for every selected Pocket language).
+voices = ["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"]
+# All built-in alternatives in installed Pocket 4.0.1 (case sensitive):
+# alba, anna, azelma, bill_boerst, caro_davy, charles, cosette, daan, eponine,
+# estelle, eve, fantine, george, giovanni, jane, javert, jean, juergen, lola,
+# marius, mary, michael, paul, peter_yearsley, rafael, stuart_bell, vera.
+# These eight selected above are the original English voice set.
+languages = ["english_2026-01"]        # Original 100M model used by the assistant.
+# Other installed model identifiers (may download additional weights; match text to language):
+# english, english_2026-04, english_2026-04_24l, english_2026-09,
+# english_2026-09_2, english_2026-09_24l, english_2026-10, english_drifting_26-09,
+# english_18m_2026-10, english_18m_refl_2026-10, english_7m_2026-10,
+# english_7m_refl_2026-10, english_2m_2026-10, english_2m_refl_2026-10,
+# french, french_24l, german, german_24l, italian, italian_24l,
+# portuguese, portuguese_24l, spanish, spanish_24l, dutch, dutch_24l.
+# Pocket has no native speaking-speed parameter in this adapter; it is run once per voice,
+# regardless of the Kitten speeds below. Audio is saved at its original 24 kHz sample rate.
+decode_steps = 1                    # Positive integer; try 1, 2, 4 for speed/quality tradeoffs.
+# Optional numeric overrides; omit to use Pocket's model defaults (recorded in report.json).
+# temperature = 0.3                 # >= 0; higher means more variation.
+# noise_clamp = 3.0                 # > 0; omit for no clamp.
+# eos_threshold = -4.0              # Finite float; higher can prolong speech.
+
+[kitten]
+voices = ["Bella", "Jasper", "Luna", "Bruno", "Rosie", "Hugo", "Kiki", "Leo"]
+# All alternatives are selected above; capitalization matters.
+speeds = [1.0]                      # Any numbers 0.5–2.0; e.g. [0.85, 1.0, 1.15].
+# Speed is a multiplier: lower = slower speech, higher = faster speech.
+# Kitten's voice-specific speed prior is also recorded as effective_speed.
+
+[[prompts]]
+name = "conversation"
+text = "The time is half past three, and I'm ready for your next question. Would you like me to keep going?"
+# Add more [[prompts]] blocks for length, numbers, questions, pauses, and pronunciation tests.
+# Text must be 1–2000 characters and contain non-whitespace text.
+# [[prompts]]
+# name = "longer"
+# text = "Well, that was unexpected! Let's take a breath and try again. The train leaves at 3:45, and the ticket costs 125 kronor. Could you check the platform before we leave? I would rather have a few minutes to spare."

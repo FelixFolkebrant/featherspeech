@@ -1,0 +1,48 @@
+[audio]
+# Created by scripts/vc; explicit IDs prevent accidental fallback to the laptop mic.
+input = "vc_capture"
+output = "vc_playback"
+capture_queue_ms = 2000
+playback_queue_ms = 1500
+
+[models]
+silero = "models/silero_vad.onnx"
+smart_turn = "models/smart-turn-v3.2-cpu.onnx"
+# tiny.en favors latency. base.en is also downloaded for accuracy comparisons.
+whisper = "models/ggml-tiny.en.bin"
+language = "en"
+whisper_threads = 4
+onnx_threads = 1
+
+# Conversation/context knobs. Restart the voice assistant service after changing these.
+[agent]
+history_turns = 64
+max_response_tokens = 1024
+
+[conversation]
+vad_threshold = 0.60
+min_rms_db = -42.0
+speech_start_ms = 96
+barge_in_ms = 128
+min_speech_ms = 192
+pre_roll_ms = 320
+silence_ms = 256
+smart_turn_threshold = 0.5
+smart_turn_retry_ms = 256
+max_silence_ms = 1600
+max_utterance_ms = 30000
+partial_stt_ms = 1500
+# Start a new conversation after ten idle minutes; prior records remain searchable.
+inactivity_secs = 600
+dismissal_cooldown_ms = 2000
+dismissals = ["goodbye", "go to sleep", "stop listening", "that's all", "that is all"]
+
+[services]
+agent_socket = "run/agent.sock"
+tts_url = "http://127.0.0.1:8765"
+turn_timeout_secs = 90
+
+[logging]
+directory = "logs"
+# Opt in to logging recognized words; audio is never saved by the live engine.
+transcripts = false
